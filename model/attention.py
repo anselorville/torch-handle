@@ -232,55 +232,82 @@ class MultiHeadAttention(nn.Module):
         K = self.split_heads(K)
         V = self.split_heads(V)
         
-        # 3. 调整 mask 的维度以匹配多头，并在需要时叠加局部滑窗掩码
+        # 3. 调整 mask 的维度以匹配多头
         # 期望 mask 为布尔型，True 表示可见，False 表示不可见
         if mask is not None:
             # mask shape: (batch, 1, seq_len_k) or (batch, seq_len_q, seq_len_k)
             # 扩展为: (batch, 1, seq_len_q, seq_len_k)
             mask = mask.unsqueeze(1)
         
-        if self.attention_type == 'local':
-            # 仅在 query/key 均存在序列维度时构造局部掩码
-            seq_len_q = Q.size(-2)
-            seq_len_k = K.size(-2)
-            if self.window_size is None or self.window_size <= 0:
-                raise ValueError("local 注意力需要有效的 window_size (> 0)")
-            # 构造 |i - j| <= window_size 的可见性矩阵
-            # shape: (seq_len_q, seq_len_k)
-            device = Q.device
-            q_positions = torch.arange(seq_len_q, device=device).unsqueeze(1)  # (seq_len_q, 1)
-            k_positions = torch.arange(seq_len_k, device=device).unsqueeze(0)  # (1, seq_len_k)
-            local_visible = (q_positions - k_positions).abs() <= self.window_size  # (seq_len_q, seq_len_k)
-            local_visible = local_visible.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len_q, seq_len_k)
-            if mask is None:
-                mask = local_visible
-            else:
-                # 与外部 mask 取交集（AND）
-                mask = mask & local_visible
-        
-        # 4. 计算缩放点积注意力
-        # 构造可选的注意力偏置（ALiBi）
+        # 4. 构造可选的注意力偏置（ALiBi），以及 RoPE 旋转
         attn_bias = None
         if self.position_embedding_type == 'alibi':
             # 复用预计算的 slopes，并适配当前设备与数据类型
             slopes = self.alibi_slopes.to(device=Q.device, dtype=Q.dtype)
-            seq_len_q = Q.size(-2)
-            seq_len_k = K.size(-2)
-            q_pos = torch.arange(seq_len_q, device=Q.device).view(1, 1, seq_len_q, 1)
-            k_pos = torch.arange(seq_len_k, device=Q.device).view(1, 1, 1, seq_len_k)
-            relative = k_pos - q_pos  # 正向看未来为正，需在 decoder 自注意力配合 causal mask
-            attn_bias = slopes * relative
+            Lq = Q.size(-2)
+            Lk = K.size(-2)
+            if self.attention_type == 'full':
+                q_pos = torch.arange(Lq, device=Q.device).view(1, 1, Lq, 1)
+                k_pos = torch.arange(Lk, device=Q.device).view(1, 1, 1, Lk)
+                relative = k_pos - q_pos
+                attn_bias = slopes * relative
         
         # RoPE（仅作用于自注意力的 Q/K 旋转）
         if self.position_embedding_type == 'rope':
             Q, K = self._apply_rope(Q, K)
-        attn_output, attention_weights = self.attention(Q, K, V, mask, attn_bias)
         
-        # 5. 合并多头：(batch, num_heads, seq_len, d_k) → (batch, seq_len, d_model)
+        if self.attention_type == 'local':
+            # 分块滑窗计算，避免构造全量 O(n^2) 分数矩阵
+            B, H, Lq, _ = Q.size()
+            Lk = K.size(-2)
+            if self.window_size is None or self.window_size <= 0:
+                raise ValueError("local 注意力需要有效的 window_size (> 0)")
+            block_size = min(1024, Lq)
+            pos_q_all = torch.arange(Lq, device=Q.device)
+            pos_k_all = torch.arange(Lk, device=Q.device)
+            outputs = []
+            weights = []
+            for q_start in range(0, Lq, block_size):
+                q_end = min(q_start + block_size, Lq)
+                k_start = max(0, q_start - self.window_size)
+                k_end = min(Lk, q_end + self.window_size)
+                Qb = Q[:, :, q_start:q_end, :]
+                Kb = K[:, :, k_start:k_end, :]
+                Vb = V[:, :, k_start:k_end, :]
+                b = q_end - q_start
+                k_sub = k_end - k_start
+                # 局部可见性掩码 (1,1,b,k_sub)
+                q_pos = pos_q_all[q_start:q_end].unsqueeze(1)
+                k_pos = pos_k_all[k_start:k_end].unsqueeze(0)
+                local_visible = (q_pos - k_pos).abs() <= self.window_size
+                local_visible = local_visible.view(1, 1, b, k_sub)
+                # 外部 mask 子块
+                block_mask = local_visible
+                if mask is not None:
+                    if mask.size(2) == 1:
+                        # (B,1,1,Lk) → 取子块并扩展到 b
+                        ext = mask[:, :, :, k_start:k_end]
+                        block_mask = block_mask & ext.expand(-1, -1, b, -1)
+                    else:
+                        # (B,1,Lq,Lk)
+                        ext = mask[:, :, q_start:q_end, k_start:k_end]
+                        block_mask = block_mask & ext
+                # ALiBi 子块偏置
+                attn_bias_sub = None
+                if self.position_embedding_type == 'alibi' and self.alibi_slopes is not None:
+                    slopes_b = self.alibi_slopes.to(device=Qb.device, dtype=Qb.dtype)
+                    rel = k_pos - q_pos  # (b, k_sub)
+                    attn_bias_sub = slopes_b * rel.view(1, 1, b, k_sub)
+                out_b, w_b = self.attention(Qb, Kb, Vb, block_mask, attn_bias_sub)
+                outputs.append(out_b)
+                weights.append(w_b)
+            attn_output = torch.cat(outputs, dim=2)
+            attention_weights = None if any(w is None for w in weights) else torch.cat(weights, dim=2)
+        else:
+            attn_output, attention_weights = self.attention(Q, K, V, mask, attn_bias)
+        
+        # 合并多头并映射回 d_model
         attn_output = self.combine_heads(attn_output)
-        
-        # 6. 最终线性投影
         output = self.W_o(attn_output)
-        
         return output, attention_weights
 
