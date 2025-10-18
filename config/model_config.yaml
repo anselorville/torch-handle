@@ -1,0 +1,57 @@
+# Transformer 模型配置文件
+
+# 模型架构参数
+model:
+  d_model: 512                  # 模型的嵌入维度
+  num_heads: 8                  # 多头注意力的头数
+  num_encoder_layers: 6         # 编码器层数
+  num_decoder_layers: 6         # 解码器层数
+  d_ff: 2048                    # FFN 的隐藏层维度
+  max_len: 5000                 # 支持的最大序列长度
+  dropout: 0.1                  # Dropout 概率
+  activation: 'relu'            # 激活函数类型 ('relu' 或 'gelu')
+  use_checkpoint: false         # 是否使用梯度检查点
+
+# 词汇表配置
+vocab:
+  src_vocab_size: 10000         # 源语言词汇表大小
+  tgt_vocab_size: 10000         # 目标语言词汇表大小
+  src_pad_idx: 0                # 源语言填充索引
+  tgt_pad_idx: 0                # 目标语言填充索引
+
+# 训练配置
+training:
+  num_epochs: 20                # 训练的总 epoch 数
+  batch_size: 32                # 每个 GPU 的批次大小
+  learning_rate: 0.0001         # 学习率
+  warmup_steps: 4000            # 学习率预热步数
+  weight_decay: 0.01            # 权重衰减
+  gradient_clip: 1.0            # 梯度裁剪阈值
+  save_every: 1                 # 每隔多少个 epoch 保存一次 checkpoint
+
+# 数据配置
+data:
+  train_src: './data/train.src'     # 训练集源语言文件
+  train_tgt: './data/train.tgt'     # 训练集目标语言文件
+  val_src: './data/val.src'         # 验证集源语言文件
+  val_tgt: './data/val.tgt'         # 验证集目标语言文件
+  num_workers: 4                    # DataLoader 工作进程数
+  pin_memory: true                  # 是否使用页面锁定内存
+
+# 分布式训练配置
+distributed:
+  mode: 'ddp'                   # 训练模式 ('single', 'ddp', 'deepspeed')
+  deepspeed_config: './config/ds_config_stage2.json'  # DeepSpeed 配置文件路径
+
+# Checkpoint 配置
+checkpoint:
+  checkpoint_dir: './checkpoints'   # Checkpoint 保存目录
+  resume_from: null                 # 恢复训练的 checkpoint 路径（null 表示从头开始）
+
+# 日志配置
+logging:
+  log_dir: './logs'             # 日志目录
+  tensorboard: true             # 是否使用 TensorBoard
+  enable_profiler: false        # 是否启用性能分析
+  profile_steps: 10             # 性能分析的步数
+

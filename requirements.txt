@@ -1,0 +1,28 @@
+# PyTorch 核心依赖
+torch>=1.10.0
+torchvision>=0.11.0
+
+# 分布式训练
+deepspeed>=0.7.0
+
+# 数据处理
+numpy>=1.21.0
+
+# 进度条
+tqdm>=4.62.0
+
+# 配置文件解析
+pyyaml>=5.4.1
+
+# TensorBoard（性能分析和日志）
+tensorboard>=2.8.0
+
+# 可选：文本处理（如果使用真实数据集）
+# torchtext>=0.11.0
+# spacy>=3.0.0
+# sentencepiece>=0.1.96
+
+# 可选：模型加速
+# apex  # NVIDIA Apex（混合精度训练）
+# flash-attn  # Flash Attention（加速注意力计算）
+
