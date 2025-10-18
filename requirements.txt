@@ -25,4 +25,6 @@ tensorboard>=2.8.0
 # 可选：模型加速
 # apex  # NVIDIA Apex（混合精度训练）
 # flash-attn  # Flash Attention（加速注意力计算）
+xformers>=0.0.22
+rouge-score>=0.1.2
 

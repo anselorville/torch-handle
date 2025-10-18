@@ -91,7 +91,8 @@ class TransformerEmbedding(nn.Module):
         d_model: int,
         max_len: int = 5000,
         dropout: float = 0.1,
-        padding_idx: int = 0
+        padding_idx: int = 0,
+        position_embedding_type: str = 'sinusoidal'
     ):
         super(TransformerEmbedding, self).__init__()
         
@@ -102,8 +103,12 @@ class TransformerEmbedding(nn.Module):
             padding_idx=padding_idx
         )
         
-        # 位置编码层
-        self.positional_encoding = PositionalEncoding(d_model, max_len, dropout)
+        # 位置编码类型：'sinusoidal' 时启用固定位置相加；'alibi'/'t5_relative' 等相对方案在注意力中处理
+        self.position_embedding_type = position_embedding_type
+        if self.position_embedding_type == 'sinusoidal':
+            self.positional_encoding = PositionalEncoding(d_model, max_len, dropout)
+        else:
+            self.positional_encoding = None
         
         # 缩放因子（按照原始论文，嵌入需要乘以 sqrt(d_model)）
         self.scale = math.sqrt(d_model)
@@ -121,6 +126,8 @@ class TransformerEmbedding(nn.Module):
         # 词嵌入并缩放
         token_emb = self.token_embedding(x) * self.scale
         
-        # 添加位置编码
-        return self.positional_encoding(token_emb)
+        # 添加或跳过位置编码
+        if self.positional_encoding is not None:
+            return self.positional_encoding(token_emb)
+        return token_emb
 

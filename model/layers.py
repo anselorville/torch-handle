@@ -97,20 +97,47 @@ class TransformerBlock(nn.Module):
         d_ff: int,
         dropout: float = 0.1,
         activation: str = 'relu',
-        is_decoder: bool = False
+        is_decoder: bool = False,
+        self_attention_type: str = 'full',
+        self_attention_window: int = None,
+        cross_attention_type: str = 'full',
+        cross_attention_window: int = None,
+        position_embedding_type: str = 'sinusoidal',
+        attn_impl: str = 'auto',
+        rope_theta: float = 10000.0,
+        rope_scaling_type: str = 'none',
+        rope_scaling_factor: float = 1.0
     ):
         super(TransformerBlock, self).__init__()
         
         self.is_decoder = is_decoder
         
         # 1. 自注意力子层
-        self.self_attn = MultiHeadAttention(d_model, num_heads, dropout)
+        self.self_attn = MultiHeadAttention(
+            d_model, num_heads, dropout,
+            attention_type=self_attention_type,
+            window_size=self_attention_window,
+            position_embedding_type=position_embedding_type,
+            attn_impl=attn_impl,
+            rope_theta=rope_theta,
+            rope_scaling_type=rope_scaling_type,
+            rope_scaling_factor=rope_scaling_factor
+        )
         self.norm1 = nn.LayerNorm(d_model)
         self.dropout1 = nn.Dropout(dropout)
         
         # 2. 交叉注意力子层（仅用于解码器）
         if is_decoder:
-            self.cross_attn = MultiHeadAttention(d_model, num_heads, dropout)
+            self.cross_attn = MultiHeadAttention(
+                d_model, num_heads, dropout,
+                attention_type=cross_attention_type,
+                window_size=cross_attention_window,
+                position_embedding_type=position_embedding_type,
+                attn_impl=attn_impl,
+                rope_theta=rope_theta,
+                rope_scaling_type=rope_scaling_type,
+                rope_scaling_factor=rope_scaling_factor
+            )
             self.norm2 = nn.LayerNorm(d_model)
             self.dropout2 = nn.Dropout(dropout)
         
@@ -168,9 +195,20 @@ class TransformerEncoderLayer(TransformerBlock):
         num_heads: int,
         d_ff: int,
         dropout: float = 0.1,
-        activation: str = 'relu'
+        activation: str = 'relu',
+        self_attention_type: str = 'full',
+        self_attention_window: int = None,
+        position_embedding_type: str = 'sinusoidal'
     ):
-        super().__init__(d_model, num_heads, d_ff, dropout, activation, is_decoder=False)
+        super().__init__(
+            d_model, num_heads, d_ff, dropout, activation,
+            is_decoder=False,
+            self_attention_type=self_attention_type,
+            self_attention_window=self_attention_window,
+            cross_attention_type='full',
+            cross_attention_window=None,
+            position_embedding_type=position_embedding_type
+        )
 
 
 class TransformerDecoderLayer(TransformerBlock):
@@ -184,7 +222,20 @@ class TransformerDecoderLayer(TransformerBlock):
         num_heads: int,
         d_ff: int,
         dropout: float = 0.1,
-        activation: str = 'relu'
+        activation: str = 'relu',
+        self_attention_type: str = 'full',
+        self_attention_window: int = None,
+        cross_attention_type: str = 'full',
+        cross_attention_window: int = None,
+        position_embedding_type: str = 'sinusoidal'
     ):
-        super().__init__(d_model, num_heads, d_ff, dropout, activation, is_decoder=True)
+        super().__init__(
+            d_model, num_heads, d_ff, dropout, activation,
+            is_decoder=True,
+            self_attention_type=self_attention_type,
+            self_attention_window=self_attention_window,
+            cross_attention_type=cross_attention_type,
+            cross_attention_window=cross_attention_window,
+            position_embedding_type=position_embedding_type
+        )
 

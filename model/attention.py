@@ -17,6 +17,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+try:
+    from xformers.ops import memory_efficient_attention
+    _XFORMERS_AVAILABLE = True
+except Exception:
+    _XFORMERS_AVAILABLE = False
 
 
 class ScaledDotProductAttention(nn.Module):
@@ -29,16 +34,18 @@ class ScaledDotProductAttention(nn.Module):
         dropout (float): Dropout 概率，默认 0.1
     """
     
-    def __init__(self, dropout: float = 0.1):
+    def __init__(self, dropout: float = 0.1, attn_impl: str = 'auto'):
         super(ScaledDotProductAttention, self).__init__()
         self.dropout = nn.Dropout(dropout)
+        self.attn_impl = attn_impl
     
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        mask: torch.Tensor = None
+        mask: torch.Tensor = None,
+        attn_bias: torch.Tensor = None
     ) -> tuple:
         """
         前向传播
@@ -54,23 +61,43 @@ class ScaledDotProductAttention(nn.Module):
             attention_weights: 注意力权重，shape (batch, num_heads, seq_len_q, seq_len_k)
         """
         d_k = query.size(-1)
-        
-        # 计算注意力分数：QK^T / sqrt(d_k)
-        # scores shape: (batch, num_heads, seq_len_q, seq_len_k)
+        # 优先使用 PyTorch SDPA 或 xFormers（当可用、无 attn_bias 且非局部分块场景）
+        if attn_bias is None and mask is not None:
+            # 转换为 PyTorch SDPA 需要的“True 为屏蔽”掩码
+            sdpa_mask = ~mask
+        else:
+            sdpa_mask = None
+        if attn_bias is None:
+            # 尝试 SDPA
+            try:
+                attn = F.scaled_dot_product_attention(
+                    query, key, value,
+                    attn_mask=sdpa_mask,
+                    dropout_p=self.dropout.p if self.training else 0.0,
+                    is_causal=False
+                )
+                return attn, None
+            except Exception:
+                pass
+            # 尝试 xFormers
+            if _XFORMERS_AVAILABLE:
+                b, h, ql, d = query.shape
+                kl = key.size(-2)
+                q_ = query.reshape(b*h, ql, d)
+                k_ = key.reshape(b*h, kl, d)
+                v_ = value.reshape(b*h, kl, d)
+                attn = memory_efficient_attention(q_, k_, v_, attn_bias=None, p=self.dropout.p if self.training else 0.0)
+                attn = attn.reshape(b, h, ql, d)
+                return attn, None
+        # 退化到朴素实现
         scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
-        
-        # 应用掩码（如果提供）
         if mask is not None:
-            # 将掩码位置的分数设置为一个很大的负数，使 softmax 后接近 0
             scores = scores.masked_fill(mask == 0, -1e9)
-        
-        # 计算注意力权重
+        if attn_bias is not None:
+            scores = scores + attn_bias
         attention_weights = F.softmax(scores, dim=-1)
         attention_weights = self.dropout(attention_weights)
-        
-        # 计算加权值：attention_weights × V
         output = torch.matmul(attention_weights, value)
-        
         return output, attention_weights
 
 
@@ -86,7 +113,7 @@ class MultiHeadAttention(nn.Module):
         dropout (float): Dropout 概率，默认 0.1
     """
     
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1, attention_type: str = 'full', window_size: int = None, position_embedding_type: str = 'sinusoidal', attn_impl: str = 'auto', rope_theta: float = 10000.0, rope_scaling_type: str = 'none', rope_scaling_factor: float = 1.0):
         super(MultiHeadAttention, self).__init__()
         
         assert d_model % num_heads == 0, "d_model 必须能被 num_heads 整除"
@@ -94,6 +121,17 @@ class MultiHeadAttention(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_k = d_model // num_heads  # 每个头的维度
+        
+        # 注意力实现类型：'full'（全局）或 'local'（滑窗）
+        if attention_type not in ('full', 'local'):
+            raise ValueError(f"不支持的注意力类型: {attention_type}")
+        self.attention_type = attention_type
+        self.window_size = window_size
+        self.position_embedding_type = position_embedding_type
+        self.attn_impl = attn_impl
+        self.rope_theta = rope_theta
+        self.rope_scaling_type = rope_scaling_type
+        self.rope_scaling_factor = rope_scaling_factor
         
         # Q, K, V 的线性投影层
         self.W_q = nn.Linear(d_model, d_model)
@@ -104,7 +142,7 @@ class MultiHeadAttention(nn.Module):
         self.W_o = nn.Linear(d_model, d_model)
         
         # 缩放点积注意力
-        self.attention = ScaledDotProductAttention(dropout)
+        self.attention = ScaledDotProductAttention(dropout, attn_impl=self.attn_impl)
         
         self.dropout = nn.Dropout(dropout)
     
@@ -176,14 +214,63 @@ class MultiHeadAttention(nn.Module):
         K = self.split_heads(K)
         V = self.split_heads(V)
         
-        # 3. 调整 mask 的维度以匹配多头
+        # 3. 调整 mask 的维度以匹配多头，并在需要时叠加局部滑窗掩码
+        # 期望 mask 为布尔型，True 表示可见，False 表示不可见
         if mask is not None:
-            # mask shape: (batch, 1, seq_len) or (batch, seq_len_q, seq_len_k)
+            # mask shape: (batch, 1, seq_len_k) or (batch, seq_len_q, seq_len_k)
             # 扩展为: (batch, 1, seq_len_q, seq_len_k)
             mask = mask.unsqueeze(1)
         
+        if self.attention_type == 'local':
+            # 仅在 query/key 均存在序列维度时构造局部掩码
+            seq_len_q = Q.size(-2)
+            seq_len_k = K.size(-2)
+            if self.window_size is None or self.window_size <= 0:
+                raise ValueError("local 注意力需要有效的 window_size (> 0)")
+            # 构造 |i - j| <= window_size 的可见性矩阵
+            # shape: (seq_len_q, seq_len_k)
+            device = Q.device
+            q_positions = torch.arange(seq_len_q, device=device).unsqueeze(1)  # (seq_len_q, 1)
+            k_positions = torch.arange(seq_len_k, device=device).unsqueeze(0)  # (1, seq_len_k)
+            local_visible = (q_positions - k_positions).abs() <= self.window_size  # (seq_len_q, seq_len_k)
+            local_visible = local_visible.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len_q, seq_len_k)
+            if mask is None:
+                mask = local_visible
+            else:
+                # 与外部 mask 取交集（AND）
+                mask = mask & local_visible
+        
         # 4. 计算缩放点积注意力
-        attn_output, attention_weights = self.attention(Q, K, V, mask)
+        # 构造可选的注意力偏置（ALiBi）
+        attn_bias = None
+        if self.position_embedding_type == 'alibi':
+            # 生成每个头的斜率
+            def _get_alibi_slopes(n):
+                import math as _m
+                def get_slopes_power_of_2(n):
+                    start = 2 ** (-2 ** -1)
+                    ratio = start
+                    return [_m.pow(start, i + 1) for i in range(n)]
+                if _m.log2(n).is_integer():
+                    slopes = get_slopes_power_of_2(n)
+                else:
+                    closest_power_of_2 = 2 ** _m.floor(_m.log2(n))
+                    slopes = get_slopes_power_of_2(closest_power_of_2)
+                    extra = get_slopes_power_of_2(2 * closest_power_of_2)[0::2]
+                    slopes += extra[: n - closest_power_of_2]
+                return torch.tensor(slopes, device=Q.device, dtype=Q.dtype)
+            slopes = _get_alibi_slopes(self.num_heads).view(1, self.num_heads, 1, 1)
+            seq_len_q = Q.size(-2)
+            seq_len_k = K.size(-2)
+            q_pos = torch.arange(seq_len_q, device=Q.device).view(1, 1, seq_len_q, 1)
+            k_pos = torch.arange(seq_len_k, device=Q.device).view(1, 1, 1, seq_len_k)
+            relative = k_pos - q_pos  # 正向看未来为正，需在 decoder 自注意力配合 causal mask
+            attn_bias = slopes * relative
+        
+        # RoPE（仅作用于自注意力的 Q/K 旋转）
+        if self.position_embedding_type == 'rope':
+            Q, K = self._apply_rope(Q, K)
+        attn_output, attention_weights = self.attention(Q, K, V, mask, attn_bias)
         
         # 5. 合并多头：(batch, num_heads, seq_len, d_k) → (batch, seq_len, d_model)
         attn_output = self.combine_heads(attn_output)
