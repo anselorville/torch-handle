@@ -145,6 +145,24 @@ class MultiHeadAttention(nn.Module):
         self.attention = ScaledDotProductAttention(dropout, attn_impl=self.attn_impl)
         
         self.dropout = nn.Dropout(dropout)
+
+        # 预计算 ALiBi 斜率并缓存为 buffer（仅在启用 alibi 时）
+        if self.position_embedding_type == 'alibi':
+            import math as _m
+            def _get_slopes_power_of_2(n: int):
+                start = 2 ** (-2 ** -1)
+                return [_m.pow(start, i + 1) for i in range(n)]
+            if _m.log2(self.num_heads).is_integer():
+                slopes_list = _get_slopes_power_of_2(self.num_heads)
+            else:
+                closest = 2 ** _m.floor(_m.log2(self.num_heads))
+                slopes_list = _get_slopes_power_of_2(closest)
+                extra = _get_slopes_power_of_2(2 * closest)[0::2]
+                slopes_list += extra[: self.num_heads - closest]
+            slopes = torch.tensor(slopes_list, dtype=torch.float32).view(1, self.num_heads, 1, 1)
+            self.register_buffer('alibi_slopes', slopes, persistent=False)
+        else:
+            self.alibi_slopes = None
     
     def split_heads(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -244,22 +262,8 @@ class MultiHeadAttention(nn.Module):
         # 构造可选的注意力偏置（ALiBi）
         attn_bias = None
         if self.position_embedding_type == 'alibi':
-            # 生成每个头的斜率
-            def _get_alibi_slopes(n):
-                import math as _m
-                def get_slopes_power_of_2(n):
-                    start = 2 ** (-2 ** -1)
-                    ratio = start
-                    return [_m.pow(start, i + 1) for i in range(n)]
-                if _m.log2(n).is_integer():
-                    slopes = get_slopes_power_of_2(n)
-                else:
-                    closest_power_of_2 = 2 ** _m.floor(_m.log2(n))
-                    slopes = get_slopes_power_of_2(closest_power_of_2)
-                    extra = get_slopes_power_of_2(2 * closest_power_of_2)[0::2]
-                    slopes += extra[: n - closest_power_of_2]
-                return torch.tensor(slopes, device=Q.device, dtype=Q.dtype)
-            slopes = _get_alibi_slopes(self.num_heads).view(1, self.num_heads, 1, 1)
+            # 复用预计算的 slopes，并适配当前设备与数据类型
+            slopes = self.alibi_slopes.to(device=Q.device, dtype=Q.dtype)
             seq_len_q = Q.size(-2)
             seq_len_k = K.size(-2)
             q_pos = torch.arange(seq_len_q, device=Q.device).view(1, 1, seq_len_q, 1)
