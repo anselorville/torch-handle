@@ -18,13 +18,13 @@ pyyaml>=5.4.1
 tensorboard>=2.8.0
 
 # 可选：文本处理（如果使用真实数据集）
-# torchtext>=0.11.0
-# spacy>=3.0.0
-# sentencepiece>=0.1.96
+torchtext>=0.11.0
+spacy>=3.0.0
+sentencepiece>=0.1.96
 
 # 可选：模型加速
-# apex  # NVIDIA Apex（混合精度训练）
-# flash-attn  # Flash Attention（加速注意力计算）
+apex  # NVIDIA Apex（混合精度训练）
+flash-attn  # Flash Attention（加速注意力计算）
 xformers>=0.0.22
 rouge-score>=0.1.2
 
